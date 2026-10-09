@@ -300,6 +300,7 @@ def build_voice_user(
         persona_config=persona_config,
         audio_taps_dir=audio_taps_dir,
         realtime_generation=audio_native_config.realtime_generation_enabled,
+        user_goal_tracking=audio_native_config.user_goal_tracking,
     )
 
 
