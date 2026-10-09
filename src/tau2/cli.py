@@ -290,6 +290,11 @@ def add_run_args(parser):
         "Use --no-realtime-generation to disable.",
     )
     parser.add_argument(
+        "--user-goal-tracking",
+        action="store_true",
+        help="Enable experimental UGST-inspired customer tracking (requires --audio-native; adds model calls).",
+    )
+    parser.add_argument(
         "--reasoning-effort",
         type=str,
         choices=["minimal", "low", "medium", "high", "xhigh"],
@@ -622,6 +627,8 @@ def main():
             user_persona_config = PersonaConfig.from_dict(args.user_persona)  # noqa: F841
 
         # Build audio-native config if enabled
+        if args.user_goal_tracking and not args.audio_native:
+            raise ValueError("--user-goal-tracking requires --audio-native")
         audio_native_config = None
         if args.audio_native:
             # Resolve model based on provider if not specified
@@ -644,6 +651,7 @@ def main():
                 reasoning_effort=args.reasoning_effort,
                 live_config=args.live_config,
                 realtime_generation=args.realtime_generation,
+                user_goal_tracking=args.user_goal_tracking,
                 # Timing
                 tick_duration_seconds=args.tick_duration,
                 max_steps_seconds=args.max_steps_seconds,
