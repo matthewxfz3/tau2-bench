@@ -97,6 +97,10 @@ class AudioNativeConfig(BaseModel):
         default=None,
         description="Backend model, voice, and optional prompt overrides for the openai_live provider",
     )
+    user_goal_tracking: bool = Field(
+        default=False,
+        description="Enable experimental UGST-inspired customer goal tracking before full responses.",
+    )
     realtime_generation: Optional[bool] = Field(
         default=None,
         description="Whether user LLM and TTS generation run without blocking audio ticks. "
