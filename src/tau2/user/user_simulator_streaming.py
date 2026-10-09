@@ -38,6 +38,7 @@ from tau2.data_model.message import (
 from tau2.data_model.persona import InterruptTendency, PersonaConfig
 from tau2.data_model.voice import VoiceSettings
 from tau2.environment.tool import Tool
+from tau2.user.goal_tracking import GoalState, track_goals, tracking_payload
 from tau2.user.user_simulator import SYSTEM_PROMPT, get_global_user_sim_guidelines_voice
 from tau2.user.user_simulator_base import (
     OUT_OF_SCOPE,
@@ -227,6 +228,7 @@ class UserAudioStreamingState(
 
     model_config = {"arbitrary_types_allowed": True}
 
+    goal_state: Optional[GoalState] = None
     user_utterance_count: int = 0
     elapsed_samples: int = 0
     effect_scheduler: Optional[EffectScheduler] = None
@@ -449,6 +451,7 @@ class VoiceStreamingUserSimulator(
         persona_config: Optional[PersonaConfig] = None,
         audio_taps_dir: Optional["Path"] = None,
         realtime_generation: bool = False,
+        user_goal_tracking: bool = False,
     ):
         """
         Initialize the streaming user simulator.
@@ -458,6 +461,7 @@ class VoiceStreamingUserSimulator(
             instructions: The instructions for the user.
             llm: LLM model name
             llm_args: Additional LLM arguments
+            user_goal_tracking: Enable optional UGST-inspired private goal tracking.
             chunk_size: Number of units per chunk
             wait_to_respond_threshold_other: Minimum time to wait since OTHER (agent) last spoke before generating a response.
                 Both this AND wait_to_respond_threshold_self must be satisfied.
@@ -503,6 +507,7 @@ class VoiceStreamingUserSimulator(
         self.use_llm_backchannel = use_llm_backchannel
         self.interruption_check_interval = interruption_check_interval
         self.realtime_generation = realtime_generation
+        self.user_goal_tracking = user_goal_tracking
         self._generation: Future | None = None
         self._generation_action = "generate_message"
         self._listener: Future | None = None
@@ -1174,6 +1179,7 @@ class VoiceStreamingUserSimulator(
                     return self._emit_waiting_chunk(state)
                 full_message, generated_state = self._generation.result()
                 self._generation = None
+                state.goal_state = generated_state.goal_state
                 state.user_utterance_count = generated_state.user_utterance_count
                 for name in ("_llm_generation_seconds", "_tts_synthesis_seconds"):
                     setattr(state, name, getattr(generated_state, name, None))
@@ -1211,7 +1217,9 @@ class VoiceStreamingUserSimulator(
                 logger.info(
                     "Customer returned no speech or tools; continuing to listen"
                 )
-                return self._emit_waiting_chunk(state)
+                return self._emit_waiting_chunk(
+                    state, full_message if self.user_goal_tracking else None
+                )
             else:
                 logger.debug("Generating message: Creating chunk messages")
                 chunk_messages = self._create_chunk_messages(full_message)
@@ -1324,6 +1332,8 @@ class VoiceStreamingUserSimulator(
         elif self.is_stop(full_message):
             logger.debug("Tool result processing: stop message detected")
             return full_message, state
+        elif self.user_goal_tracking and not full_message.has_text_content():
+            return self._emit_waiting_chunk(state, full_message)
         else:
             # Queue chunks but DON'T start streaming yet.
             # Speech delivery is deferred to normal turn-taking on the next tick.
@@ -1336,12 +1346,59 @@ class VoiceStreamingUserSimulator(
             return waiting_chunk, state
 
     def _emit_waiting_chunk(
-        self, state: UserAudioStreamingState
+        self, state: UserAudioStreamingState, generated: Optional[UserMessage] = None
     ) -> Tuple[UserMessage, UserAudioStreamingState]:
-        """Emit background noise while waiting for tool results."""
+        """Emit background noise, retaining accounting for a silent generation."""
         noise_chunk = self._apply_chunk_effects(None, state, is_speech=False)
+        if generated is not None:
+            noise_chunk.cost = generated.cost
+            noise_chunk.usage = generated.usage
+            noise_chunk.raw_data = generated.raw_data
+            noise_chunk.generation_time_seconds = getattr(
+                state, "_llm_generation_seconds", None
+            )
         state.time_since_last_talk += 1
         return noise_chunk, state
+
+    def _track_goal_state(self, state, linearized_messages):
+        """Update private goals from the generation snapshot's heard speech only."""
+
+        def call(purpose, instructions, payload):
+            # Tracker has no tools and no nested provider retries. Do not forward
+            # response formatting/stop controls meant for customer utterances.
+            kwargs = {
+                key: value
+                for key, value in self.llm_args.items()
+                if key
+                not in {
+                    "response_format",
+                    "stop",
+                    "tools",
+                    "tool_choice",
+                    "num_retries",
+                }
+            }
+            return generate(
+                model=self.llm,
+                messages=[
+                    SystemMessage(role="system", content=instructions),
+                    UserMessage(role="user", content=tracking_payload(payload)),
+                ],
+                tools=None,
+                call_name=purpose,
+                num_retries=0,
+                **kwargs,
+            )
+
+        result = track_goals(
+            self.instructions, state.goal_state, linearized_messages, call
+        )
+        state.goal_state = result.state
+        if result.error:
+            logger.warning(
+                f"User goal tracking failed ({result.error}); using prior state"
+            )
+        return result
 
     def _generate_full_duplex_voice_message(
         self, message: ValidUserInputMessage, state: UserAudioStreamingState
@@ -1404,6 +1461,11 @@ class VoiceStreamingUserSimulator(
         )
         messages = messages + [role_reminder]
 
+        tracking = None
+        if self.user_goal_tracking:
+            tracking = self._track_goal_state(state, linearized_messages)
+            messages.append(SystemMessage(role="system", content=tracking.reminder()))
+
         # Generate response (timing is captured in llm_utils.generate)
         assistant_message = generate(
             model=self.llm,
@@ -1417,13 +1479,28 @@ class VoiceStreamingUserSimulator(
         # Use generation_time_seconds from the returned message
         state._llm_generation_seconds = assistant_message.generation_time_seconds
 
+        # Count known tracker overhead once; raw metadata flags unknown charges.
+        response_cost = assistant_message.cost
+        response_usage = assistant_message.usage
+        response_raw_data = assistant_message.raw_data
+        if tracking is not None:
+            state._llm_generation_seconds = (
+                state._llm_generation_seconds or 0.0
+            ) + tracking.duration_seconds
+            response_cost = (response_cost or 0.0) + tracking.cost
+            response_usage = dict(response_usage or {})
+            for key, value in tracking.usage.items():
+                response_usage[key] = response_usage.get(key, 0) + value
+            response_raw_data = dict(response_raw_data or {})
+            response_raw_data["goal_tracking"] = tracking.model_dump(mode="json")
+
         # Convert assistant response to user message
         user_message = UserMessage(
             role="user",
             content=assistant_message.content,
-            cost=assistant_message.cost,
-            usage=assistant_message.usage,
-            raw_data=assistant_message.raw_data,
+            cost=response_cost,
+            usage=response_usage,
+            raw_data=response_raw_data,
         )
 
         my_str = ""
